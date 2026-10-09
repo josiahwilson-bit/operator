@@ -24,6 +24,9 @@ All data synthetic. $0. No external effects. Exit 0 = pipeline healthy.
 """
 import os
 import sys
+import shutil
+import tarfile
+from datetime import datetime, timezone, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "coordinator-a"))
@@ -38,6 +41,42 @@ from discord_notify import send as notify                  # noqa: E402
 
 WORKDIR = os.path.join(HERE, "run_state")
 os.makedirs(WORKDIR, exist_ok=True)
+
+# Skill mapping: explicit config, not hidden logic. Source -> required skills.
+# (Contradiction acknowledged: this is still a heuristic. It is now at least
+# visible, reviewable, and changeable without touching code paths.)
+SOURCE_SKILLS = {
+    "mastodon": ["web"],
+    "reddit": ["web"],
+    "webhook": ["data"],
+    "email": ["data"],
+}
+
+# Contract TTLs by urgency (stalled contracts escalate, never hang forever)
+CONTRACT_TTL = {
+    "critical": timedelta(hours=4),
+    "high": timedelta(hours=24),
+    "normal": timedelta(days=3),
+    "low": timedelta(days=7),
+}
+
+
+def backup_run_state():
+    """Tarball run_state before each run. History has zero backup otherwise
+    (gitignored by design) — this is the recovery story."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(WORKDIR, f"backup-{stamp}.tar.gz")
+    with tarfile.open(dest, "w:gz") as tar:
+        for name in os.listdir(WORKDIR):
+            if name.startswith("backup-"):
+                continue
+            tar.add(os.path.join(WORKDIR, name), arcname=name)
+    # keep last 10 backups
+    backups = sorted(n for n in os.listdir(WORKDIR)
+                     if n.startswith("backup-"))
+    for old in backups[:-10]:
+        os.remove(os.path.join(WORKDIR, old))
+    return dest
 
 # ---------------------------------------------------------------- team registry
 # Trust tiers: synthetic -> sandbox -> approved. New teams enter at synthetic.
@@ -95,8 +134,7 @@ class TeamAdapter:
         return {"id": sig["id"],
                 "margin": float(urgency_value + (sig.get("amount") or 0)),
                 "hours": 2,
-                "skills": ["web"] if sig["source"] in ("mastodon", "reddit")
-                else ["data"]}
+                "skills": SOURCE_SKILLS.get(sig["source"], ["data"])}
 
 
 # ---------------------------------------------------------------- contract lifecycle
@@ -115,7 +153,15 @@ class Contract:
         self.budget = 0.0
         self.urgency = classification["urgency"]
         self.state = "proposed"
+        now = datetime.now(timezone.utc)
+        self.deadline = (now + CONTRACT_TTL[self.urgency]).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
         self.history = [("proposed", "contract created from routed signal")]
+
+    def expired(self):
+        return datetime.now(timezone.utc) > datetime.strptime(
+            self.deadline, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc)
 
     def transition(self, to, note=""):
         assert to in CONTRACT_STATES, f"unknown state {to}"
@@ -129,10 +175,13 @@ class Contract:
 
 # ---------------------------------------------------------------- pipeline
 def run():
+    backup_run_state()
+    from contract_store import upsert
     fin = FinancialClassifier()
     gate = ApprovalGate(os.path.join(WORKDIR, "gates.db"))
     audit = AuditLog(os.path.join(WORKDIR, "audit.jsonl"))
-    report = {"routed": [], "contracts": [], "disputed": [], "noise": []}
+    report = {"routed": [], "contracts": [], "disputed": [], "noise": [],
+              "expired": []}
 
     # 1. CAPTURE + 2. CLASSIFY
     routable, classified = [], {}
@@ -193,6 +242,7 @@ def run():
         report["contracts"].append(ctr)
         report["routed"].append((sig["id"], team_id,
                                  flagged.get(sig["id"], "UNASSIGNED")))
+        upsert(ctr)  # persist for the human approval path (approve.py)
 
     # 7. HUMAN REVIEW — notify on anything disputed
     if report["disputed"]:
