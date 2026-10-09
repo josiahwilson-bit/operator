@@ -42,23 +42,17 @@ from discord_notify import send as notify                  # noqa: E402
 WORKDIR = os.path.join(HERE, "run_state")
 os.makedirs(WORKDIR, exist_ok=True)
 
-# Skill mapping: explicit config, not hidden logic. Source -> required skills.
-# (Contradiction acknowledged: this is still a heuristic. It is now at least
-# visible, reviewable, and changeable without touching code paths.)
-SOURCE_SKILLS = {
-    "mastodon": ["web"],
-    "reddit": ["web"],
-    "webhook": ["data"],
-    "email": ["data"],
-}
+from settings import load as load_settings  # noqa: E402
+SETTINGS, SETTINGS_SOURCE = load_settings()
+
+# Skill mapping and TTLs now come from settings.json (operational config).
+# Gate policies, charter values, and budget are NOT here — see settings.py.
+SOURCE_SKILLS = SETTINGS["routing"]["source_skills"]
 
 # Contract TTLs by urgency (stalled contracts escalate, never hang forever)
-CONTRACT_TTL = {
-    "critical": timedelta(hours=4),
-    "high": timedelta(hours=24),
-    "normal": timedelta(days=3),
-    "low": timedelta(days=7),
-}
+from datetime import timedelta as _td
+CONTRACT_TTL = {k: _td(hours=h)
+                for k, h in SETTINGS["contracts"]["ttl_hours"].items()}
 
 
 def backup_run_state():
@@ -71,10 +65,11 @@ def backup_run_state():
             if name.startswith("backup-"):
                 continue
             tar.add(os.path.join(WORKDIR, name), arcname=name)
-    # keep last 10 backups
+    # keep last N backups (settings-driven retention)
     backups = sorted(n for n in os.listdir(WORKDIR)
                      if n.startswith("backup-"))
-    for old in backups[:-10]:
+    retention = SETTINGS["maintenance"]["backup_retention"]
+    for old in backups[:-retention]:
         os.remove(os.path.join(WORKDIR, old))
     return dest
 
@@ -176,16 +171,38 @@ class Contract:
 # ---------------------------------------------------------------- pipeline
 def run():
     backup_run_state()
-    from contract_store import upsert
+    from contract_store import upsert, load as load_contracts
+    from signals_inbox import read_inbox, archive
+    # Contract IDs must be unique across runs: resume the counter from
+    # the persistent store instead of restarting at 1.
+    existing = load_contracts()
+    if existing:
+        Contract._n = max(int(cid.split("-")[1]) for cid in existing) 
     fin = FinancialClassifier()
     gate = ApprovalGate(os.path.join(WORKDIR, "gates.db"))
     audit = AuditLog(os.path.join(WORKDIR, "audit.jsonl"))
     report = {"routed": [], "contracts": [], "disputed": [], "noise": [],
-              "expired": []}
+              "expired": [], "rejected": []}
 
-    # 1. CAPTURE + 2. CLASSIFY
+    # 1. CAPTURE: inbox first, synthetic fallback (settings-driven).
+    inbox_signals, rejected = read_inbox()
+    report["rejected"] = rejected
+    max_n = SETTINGS["capture"]["max_signals_per_run"]
+    if len(inbox_signals) > max_n:
+        report["rejected"].append(
+            ("overflow", f"{len(inbox_signals) - max_n} signals over "
+             f"the per-run cap of {max_n}; left for next run"))
+        inbox_signals = inbox_signals[:max_n]
+    use_fallback = (not inbox_signals
+                    and SETTINGS["capture"]["synthetic_fallback"])
+    signals = inbox_signals if inbox_signals else (SIGNALS if use_fallback
+                                                   else [])
+    report["capture_source"] = ("inbox" if inbox_signals
+                                else "synthetic" if use_fallback else "none")
+
+    # 2. CLASSIFY
     routable, classified = [], {}
-    for sig in SIGNALS:
+    for sig in signals:
         c = classify_signal(sig)
         classified[sig["id"]] = c
         # Money events also run through the financial classifier
@@ -267,8 +284,12 @@ def run():
 
     # 7. HUMAN REVIEW — notify on anything disputed
     if report["disputed"]:
-        notify(f"Agentic runner: {len(report['disputed'])} contract(s) need "
+        notify(f"operator: {len(report['disputed'])} contract(s) need "
                f"human review: {', '.join(report['disputed'])}")
+
+    # Archive inbox signals now that they're processed (idempotent).
+    if report["capture_source"] == "inbox":
+        archive(inbox_signals)
 
     # chain integrity
     chain_ok = audit.verify_chain()
@@ -277,9 +298,13 @@ def run():
 
 def main():
     report, chain_ok = run()
-    print("== agentic routing run (synthetic) ==")
-    print(f"signals: {len(SIGNALS)} | routable: {len(report['routed'])} "
-          f"| noise: {len(report['noise'])}")
+    print("== operator run ==")
+    print(f"capture: {report['capture_source']} "
+          f"({len(report['routed'])} routed, {len(report['noise'])} noise, "
+          f"{len(report['rejected'])} rejected)")
+    if report["rejected"]:
+        for name, why in report["rejected"]:
+            print(f"  rejected {name}: {why}")
     for sig_id, team_id, status in report["routed"]:
         print(f"  {sig_id} -> {team_id} [{status}]")
     print(f"contracts: {len(report['contracts'])}")
