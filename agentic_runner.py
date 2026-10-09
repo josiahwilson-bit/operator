@@ -199,12 +199,33 @@ def run():
             report["noise"].append(sig["id"])
 
     # 3. ROUTE via matching.py (through the adapter)
+    from routing_log import log_routing
+    from matching import eligible as _eligible
     contractors = [TeamAdapter.team_to_contractor(t) for t in TEAMS]
     opportunities = [TeamAdapter.signal_to_opportunity(s, classified[s["id"]])
                      for s in routable]
     _, assignment = solve_exact(opportunities, contractors)
     flagged = {oid: status for oid, _, _, status
                in flag_for_review(assignment, opportunities)}
+
+    # Structured routing log: why each signal went where it did.
+    opp_by_id = {o["id"]: o for o in opportunities}
+    for sig in routable:
+        opp = opp_by_id[sig["id"]]
+        candidates = []
+        for t, con in zip(TEAMS, contractors):
+            is_elig = _eligible(con, opp)
+            candidates.append({
+                "team_id": t["id"],
+                "eligible": is_elig,
+                "margin": opp["margin"] if is_elig else 0.0,
+                "reason": ("skills match" if is_elig
+                           else f"missing skills: "
+                           f"{set(opp['skills']) - set(con['skills'])}"),
+                "tier": t["tier"],
+            })
+        log_routing(sig, classified[sig["id"]], candidates,
+                    assignment.get(sig["id"]))
 
     # 4. DELEGATE -> 5. GATE -> 6. CONTRACT
     for sig in routable:
