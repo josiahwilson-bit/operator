@@ -1,0 +1,4 @@
+# Runtime state — local execution, never committed
+run_state/
+__pycache__/
+*.pyc
